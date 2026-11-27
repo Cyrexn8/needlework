@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Needlework</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧵</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="title">🧵 <span id="patternName">…</span></div>
+  <select id="projectSelect" title="Схема"></select>
+  <button id="btnImport" title="Импортировать схему из PDF">📄+</button>
+  <input type="file" id="fileImport" accept=".pdf,application/pdf" hidden>
+  <div class="progress-wrap">
+    <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+    <span id="progressText">0%</span>
+  </div>
+  <div class="header-btns">
+    <button id="btnUndo" title="Отменить (Ctrl+Z)" disabled>↶</button>
+    <button id="btnRedo" title="Вернуть (Ctrl+Y)" disabled>↷</button>
+    <span class="mode-group">
+      <button id="btnModePan" title="Режим: рука — перетаскивание схемы, тап по клетке переключает крестик">✋</button>
+      <button id="btnModePaint" title="Режим: кисть — проводить по клеткам, отмечая вышитым; с выбранным цветом красит только его клетки">🖌️</button>
+      <button id="btnModeErase" title="Режим: ластик — проводить по клеткам, снимая отметку «вышито»; с выбранным цветом стирает только его">🧽</button>
+    </span>
+    <button id="btnZoomOut" title="Уменьшить">−</button>
+    <button id="btnZoomIn" title="Увеличить">+</button>
+    <button id="btnFit" title="Вписать в экран">⤢</button>
+    <button id="btnPalette" class="mobile-only" title="Палитра">🎨</button>
+  </div>
+</header>
+<main>
+  <aside id="palettePanel">
+    <div class="palette-head">Палитра</div>
+    <button class="palette-item all" id="paletteAll">Все цвета</button>
+    <div id="paletteList"></div>
+  </aside>
+  <div id="canvasWrap"><canvas id="canvas"></canvas></div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
