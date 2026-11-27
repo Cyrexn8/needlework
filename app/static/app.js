@@ -33,21 +33,136 @@ function washedColor(rgb) {
   return `rgb(${mix((n >> 16) & 255)},${mix((n >> 8) & 255)},${mix(n & 255)})`;
 }
 
+/* ---------- хранилище: IndexedDB с фолбэком в память ---------- */
+
+const idbMem = new Map();   // если IndexedDB недоступен (приватный режим Safari)
+let idbDb = null;
+
+function openIdb() {
+  if (idbDb) return Promise.resolve(idbDb);
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open("needlework", 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore("kv");
+    rq.onsuccess = () => { idbDb = rq.result; res(idbDb); };
+    rq.onerror = () => rej(rq.error);
+  });
+}
+
+async function idbGet(key) {
+  try {
+    const db = await openIdb();
+    return await new Promise((res, rej) => {
+      const t = db.transaction("kv", "readonly").objectStore("kv").get(key);
+      t.onsuccess = () => res(t.result);
+      t.onerror = () => rej(t.error);
+    });
+  } catch (e) { return idbMem.get(key); }
+}
+
+async function idbSet(key, val) {
+  try {
+    const db = await openIdb();
+    await new Promise((res, rej) => {
+      const t = db.transaction("kv", "readwrite").objectStore("kv").put(val, key);
+      t.onsuccess = () => res();
+      t.onerror = () => rej(t.error);
+    });
+  } catch (e) { idbMem.set(key, val); }
+}
+
+async function idbDel(key) {
+  try {
+    const db = await openIdb();
+    await new Promise((res, rej) => {
+      const t = db.transaction("kv", "readwrite").objectStore("kv").delete(key);
+      t.onsuccess = () => res();
+      t.onerror = () => rej(t.error);
+    });
+  } catch (e) { idbMem.delete(key); }
+}
+
+async function idbKeys() {
+  try {
+    const db = await openIdb();
+    return await new Promise((res, rej) => {
+      const t = db.transaction("kv", "readonly").objectStore("kv").getAllKeys();
+      t.onsuccess = () => res(t.result);
+      t.onerror = () => rej(t.error);
+    });
+  } catch (e) { return [...idbMem.keys()]; }
+}
+
+/* ---------- бэкенд: локальный сервер или статика (GitHub Pages) ---------- */
+
+let MODE = "static";             // "server" | "static" — определяется автоматически
+let builtins = [];               // встроенные схемы из data/index.json (статический режим)
+
+async function detectMode() {
+  try {
+    const r = await fetch("api/projects");
+    if (r.ok && Array.isArray(await r.json())) { MODE = "server"; return; }
+  } catch (e) { /* это не наш сервер */ }
+  MODE = "static";
+}
+
+async function listProjects() {
+  if (MODE === "server") return (await (await fetch("api/projects")).json());
+  const out = [...builtins];
+  for (const k of await idbKeys()) {
+    if (!k.startsWith("pattern:")) continue;
+    const p = await idbGet(k);
+    out.push({ id: k.slice(8), name: p.name || k.slice(8), width: p.width, height: p.height });
+  }
+  return out;
+}
+
+async function loadPattern(id) {
+  if (MODE === "server") {
+    const r = await fetch(`api/pattern?project=${encodeURIComponent(id)}`);
+    if (!r.ok) throw new Error("Не удалось загрузить схему");
+    return r.json();
+  }
+  const b = builtins.find(x => x.id === id);
+  if (b) {
+    const r = await fetch(`data/${encodeURIComponent(id)}.json`);
+    if (r.ok) return r.json();
+  }
+  const p = await idbGet(`pattern:${id}`);
+  if (p) return p;
+  throw new Error("Схема не найдена");
+}
+
+async function loadProgress(id) {
+  if (MODE === "server") {
+    const r = await fetch(`api/progress?project=${encodeURIComponent(id)}`);
+    return r.ok ? r.json() : { done: {} };
+  }
+  return (await idbGet(`progress:${id}`)) || { done: {} };
+}
+
+async function saveProgressData(id, doneObj) {
+  if (MODE === "server") {
+    await fetch(`api/progress?project=${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ done: doneObj }),
+      keepalive: true,
+    });
+    return;
+  }
+  await idbSet(`progress:${id}`, { done: doneObj });
+}
+
 /* ---------- загрузка ---------- */
 
 async function load() {
   const project = currentProject();
-  const [pRes, gRes] = await Promise.all([
-    fetch(`/api/pattern?project=${encodeURIComponent(project)}`),
-    fetch(`/api/progress?project=${encodeURIComponent(project)}`),
-  ]);
-  if (!pRes.ok) throw new Error("Не удалось загрузить схему");
-  P = await pRes.json();
+  const [pattern, prog] = await Promise.all([loadPattern(project), loadProgress(project)]);
+  P = pattern;
   paletteById = new Map(P.palette.map(p => {
     p._washed = washedColor(p.rgb);   // «стёртый» вариант цвета для вышитых клеток
     return [p.id, p];
   }));
-  const prog = gRes.ok ? await gRes.json() : { done: {} };
   done = new Map(Object.entries(prog.done || {}).map(([k, v]) => [k, v]));
 
   document.getElementById("patternName").textContent = P.name;
@@ -67,7 +182,7 @@ function currentProject() {
 async function initProjects() {
   const sel = document.getElementById("projectSelect");
   try {
-    const list = await (await fetch("/api/projects")).json();
+    const list = await listProjects();
     sel.innerHTML = "";
     for (const p of list) {
       const o = document.createElement("option");
@@ -95,15 +210,26 @@ fileImport.addEventListener("change", async () => {
   btnImport.disabled = true;
   btnImport.textContent = "⏳";
   try {
-    const fd = new FormData();
-    fd.append("file", f);
-    const res = await fetch("/api/import/pdf", { method: "POST", body: fd });
-    const data = await res.json();
-    if (!res.ok) {
-      alert("Импорт не удался: " + (data.detail || res.statusText));
-      return;
+    if (MODE === "server") {
+      const fd = new FormData();
+      fd.append("file", f);
+      const res = await fetch("api/import/pdf", { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) {
+        alert("Импорт не удался: " + (data.detail || res.statusText));
+        return;
+      }
+      location.search = "?project=" + encodeURIComponent(data.project);
+    } else {
+      const r = await importDataFile(f);
+      if (r.kind === "backup") {
+        await initProjects();
+        alert("Бэкап восстановлен: схем " + r.count +
+              ", файлов прогресса " + r.progressCount);
+      } else {
+        location.search = "?project=" + encodeURIComponent(r.id);
+      }
     }
-    location.search = "?project=" + encodeURIComponent(data.project);
   } catch (e) {
     alert("Ошибка импорта: " + e.message);
   } finally {
@@ -113,7 +239,79 @@ fileImport.addEventListener("change", async () => {
   }
 });
 
-initProjects();
+/* Импорт файла в статическом режиме: pattern.json или файл бэкапа. */
+function slugName(s) {
+  const t = (s || "").replace(/[^\wа-яё-]+/gi, "_").replace(/^_+|_+$/g, "");
+  return (t || "schema").slice(0, 60);
+}
+
+async function importDataFile(file) {
+  let j;
+  try { j = JSON.parse(await file.text()); }
+  catch (e) { throw new Error("файл не является JSON"); }
+  if (j && Array.isArray(j.patterns)) {                     // файл бэкапа
+    let progressCount = 0;
+    for (const it of j.patterns) await idbSet(`pattern:${it.id}`, it.data);
+    if (j.progress && typeof j.progress === "object") {
+      for (const [k, v] of Object.entries(j.progress)) {
+        await idbSet(`progress:${k}`, { done: v || {} });
+        progressCount++;
+      }
+    }
+    return { kind: "backup", count: j.patterns.length, progressCount };
+  }
+  if (j && Array.isArray(j.grid) && Array.isArray(j.palette)
+      && Number.isFinite(j.width) && Number.isFinite(j.height)) {   // схема
+    const used = new Set(builtins.map(b => b.id));
+    for (const k of await idbKeys()) if (k.startsWith("pattern:")) used.add(k.slice(8));
+    const base = slugName(j.name || file.name.replace(/\.json$/i, ""));
+    let id = base;
+    for (let n = 2; used.has(id); n++) id = `${base}_${n}`;
+    await idbSet(`pattern:${id}`, j);
+    return { kind: "pattern", id };
+  }
+  throw new Error("файл не похож на схему или бэкап");
+}
+
+/* Экспорт всего содержимого хранилища в файл-бэкап (только статический режим). */
+async function exportAll() {
+  const progress = {}, patterns = [];
+  for (const k of await idbKeys()) {
+    if (k.startsWith("progress:")) {
+      const v = await idbGet(k);
+      progress[k.slice(9)] = (v && v.done) || {};
+    } else if (k.startsWith("pattern:")) {
+      patterns.push({ id: k.slice(8), data: await idbGet(k) });
+    }
+  }
+  return { app: "needlework", version: 1, date: new Date().toISOString(), patterns, progress };
+}
+
+function downloadJSON(obj, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(obj)], { type: "application/json" }));
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+const btnExport = document.getElementById("btnExport");
+btnExport.addEventListener("click", async () => {
+  try {
+    downloadJSON(await exportAll(),
+      `needlework-backup-${new Date().toISOString().slice(0, 10)}.json`);
+  } catch (e) { alert("Не удалось экспортировать: " + e.message); }
+});
+
+const btnDelete = document.getElementById("btnDelete");
+btnDelete.addEventListener("click", async () => {
+  const id = currentProject();
+  if (builtins.some(b => b.id === id)) { alert("Встроенную схему удалить нельзя"); return; }
+  if (!confirm(`Удалить схему «${id}» и её прогресс с этого устройства?`)) return;
+  await idbDel(`pattern:${id}`);
+  await idbDel(`progress:${id}`);
+  location.search = "?project=demo";
+});
 
 /* ---------- палитра ---------- */
 
@@ -178,15 +376,8 @@ function scheduleSave() {
 }
 
 async function saveProgress() {
-  const project = currentProject();
-  const body = JSON.stringify({ done: Object.fromEntries(done) });
   try {
-    await fetch(`/api/progress?project=${encodeURIComponent(project)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      keepalive: true,
-    });
+    await saveProgressData(currentProject(), Object.fromEntries(done));
   } catch (e) { /* при следующем изменении попробуем снова */ }
 }
 
@@ -600,7 +791,19 @@ document.getElementById("btnFit").addEventListener("click", () => { fitView(); d
 document.getElementById("btnPalette").addEventListener("click", () =>
   palettePanel.classList.toggle("open"));
 
-load().catch(err => {
+/* ---------- запуск ---------- */
+
+(async () => {
+  await detectMode();
+  document.body.classList.toggle("static", MODE === "static");
+  if (MODE === "static") {
+    builtins = await (await fetch("data/index.json")).json();
+    fileImport.accept = ".json,application/json";
+    btnImport.title = "Импортировать схему (pattern.json) или файл бэкапа";
+  }
+  await initProjects();
+  await load();
+})().catch(err => {
   document.getElementById("patternName").textContent = "Ошибка загрузки";
   console.error(err);
 });

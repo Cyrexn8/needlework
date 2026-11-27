@@ -138,6 +138,11 @@ canvas {
 canvas.dragging { cursor: grabbing; }
 canvas.paint-mode { cursor: crosshair; }
 
+/* Кнопки статического режима (GitHub Pages): без сервера хранить нечего, кроме
+   импортированного — экспорт бэкапа и удаление схемы видны только там */
+.static-only { display: none; }
+body.static .static-only { display: inline-block; }
+
 /* Мобильная версия: палитра — выдвижная снизу */
 .mobile-only { display: none; }
 @media (max-width: 767px) {
