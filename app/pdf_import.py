@@ -31,18 +31,34 @@ def cluster_1d(vals, tol=1.5):
     return [sum(g) / len(g) for g in groups]
 
 
-def page_glyphs(page, size=7.0):
-    """Глифы шрифта CrossStitch (size~7 — клетки схемы, ~10 — легенды): (cx, cy, text)."""
+def page_glyphs(page, size=None):
+    """Глифы шрифта CrossStitch: (cx, cy, text).
+
+    size=None — все размеры; число — с допуском ±1.0 (символы схемы 7–9pt,
+    легенды ~10pt, маркеры ~3pt).
+    """
     out = []
     d = page.get_text("dict")
     for blk in d["blocks"]:
         for ln in blk.get("lines", []):
             for sp in ln["spans"]:
-                if "CrossStitch" in sp["font"] and abs(sp["size"] - size) < 1.0:
+                if "CrossStitch" in sp["font"] and (size is None or abs(sp["size"] - size) < 1.0):
                     x = (sp["bbox"][0] + sp["bbox"][2]) / 2
                     y = (sp["bbox"][1] + sp["bbox"][3]) / 2
                     out.append((x, y, sp["text"].strip()))
     return out
+
+
+def cs_sizes(page):
+    """Counter размеров глифов CrossStitch на странице."""
+    c = Counter()
+    d = page.get_text("dict")
+    for blk in d["blocks"]:
+        for ln in blk.get("lines", []):
+            for sp in ln["spans"]:
+                if "CrossStitch" in sp["font"]:
+                    c[round(sp["size"], 1)] += 1
+    return c
 
 
 def page_cell_fills(page):
@@ -98,14 +114,35 @@ def nearest_index(coord, centers):
     return min(range(len(centers)), key=lambda i: abs(centers[i] - coord))
 
 
+def _linfit(points):
+    """МНК-прямая y = a*x + b по точкам (минимум 2)."""
+    n = len(points)
+    sx = sum(p[0] for p in points)
+    sy = sum(p[1] for p in points)
+    sxx = sum(p[0] * p[0] for p in points)
+    sxy = sum(p[0] * p[1] for p in points)
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return None
+    a = (n * sxy - sx * sy) / denom
+    b = (sy - a * sx) / n
+    return a, b
+
+
 def parse_legend(page, report):
-    """Легенда: symbol_glyph → {'dmc': str, 'count': int, 'rgb': (r,g,b)|None}."""
-    glyphs = [g for g in page_glyphs(page, 10.0) if g[2]]      # без пустых «отступных»
+    """Легенда: symbol_glyph → {'dmc': str, 'count': int, 'rgb': (r,g,b)|None}.
+
+    Образцы цвета — картинки или векторные прямоугольники-заливки слева от глифа.
+    """
+    glyphs = [g for g in page_glyphs(page) if g[2]]            # без пустых «отступных»
     words = page.get_text("words")
     images = []
     for i in page.get_images(full=True):
         for r in page.get_image_rects(i[0]):
             images.append(r)
+    vector_swatches = [dr["rect"] for dr in page.get_drawings()
+                       if dr["type"] in ("f", "fs") and dr.get("fill")
+                       and 3 < dr["rect"].width < 20 and 3 < dr["rect"].height < 20]
     entries = {}
     for gx, gy, sym in glyphs:
         # ближайшее слово справа в той же строке: сначала DMC, затем количество
@@ -117,13 +154,22 @@ def parse_legend(page, report):
             continue
         dmc = nums[0]
         cnt = int(nums[1]) if len(nums) > 1 else None
-        # ближайшая картинка-образец слева
+        # ближайший образец слева: картинка или векторная заливка
         rgb = None
-        cand = [r for r in images if abs((r.y0 + r.y1) / 2 - gy) < 6 and r.x1 <= gx + 2]
-        if cand:
-            r = min(cand, key=lambda r: gx - r.x1)
+        img_cand = [r for r in images if abs((r.y0 + r.y1) / 2 - gy) < 6 and r.x1 <= gx + 2]
+        vec_cand = [r for r in vector_swatches
+                    if abs((r.y0 + r.y1) / 2 - gy) < 6 and r.x1 <= gx + 2]
+        if img_cand and (not vec_cand or min(gx - r.x1 for r in img_cand)
+                         <= min(gx - r.x1 for r in vec_cand)):
+            r = min(img_cand, key=lambda r: gx - r.x1)
             pix = page.get_pixmap(clip=r)
             rgb = _pix_avg(pix)
+        elif vec_cand:
+            r = min(vec_cand, key=lambda r: gx - r.x1)
+            for dr in page.get_drawings():
+                if dr["rect"] == r and dr.get("fill"):
+                    rgb = tuple(dr["fill"])
+                    break
         if sym in entries and entries[sym]["dmc"] != dmc:
             report.append(f"! легенда: символ {sym!r} встречен с разными номерами: "
                           f"{entries[sym]['dmc']} и {dmc}")
@@ -159,9 +205,14 @@ def parse_backstitch_legend(page):
     return mapping
 
 
-def parse_chart_page(page, report):
-    """Лист схемы → {col, row, color, symbol} в локальных индексах + бэкстич + ¾."""
-    glyphs = page_glyphs(page, 7.0)
+def parse_chart_page(page, report, chart_size):
+    """Лист схемы → клетки в глобальных индексах + бэкстич + ¾-кресты.
+
+    Координаты клеток: аффинное отображение «точка PDF → номер клетки»,
+    построенное по линейкам (МНК) — устойчиво к пустым колонкам/рядам и
+    «дрожанию» координат. Без линеек — позиционное приближение.
+    """
+    glyphs = page_glyphs(page, chart_size)
     strokes = page_colored_strokes(page)
     if len(glyphs) < 100:
         return None
@@ -172,11 +223,48 @@ def parse_chart_page(page, report):
     pitch_x = (gx[-1] - gx[0]) / (len(gx) - 1)
     pitch_y = (gy[-1] - gy[0]) / (len(gy) - 1)
 
+    # линейки: Arial ~6pt с номерами, кратными 10; ось — по положению относительно сетки
+    rulers_h, rulers_v = [], []   # rulers_h: (x, номер колонки); rulers_v: (y, номер ряда)
+    d = page.get_text("dict")
+    for blk in d["blocks"]:
+        for ln in blk.get("lines", []):
+            for sp in ln["spans"]:
+                if "Arial" in sp["font"] and abs(sp["size"] - 6.0) < 0.5:
+                    t = sp["text"].strip()
+                    if not (re.fullmatch(r"\d+", t) and int(t) % 10 == 0):
+                        continue
+                    cx = (sp["bbox"][0] + sp["bbox"][2]) / 2
+                    cy = (sp["bbox"][1] + sp["bbox"][3]) / 2
+                    above_or_below = cy < gy[0] - 0.4 * pitch_y or cy > gy[-1] + 0.4 * pitch_y
+                    left_or_right = cx < gx[0] - 0.4 * pitch_x or cx > gx[-1] + 0.4 * pitch_x
+                    if above_or_below:
+                        rulers_h.append((cx, int(t)))
+                    elif left_or_right:
+                        rulers_v.append((cy, int(t)))
+
+    def fit_axis(pts, c0, pitch):
+        """Аффинное отображение «координата → индекс клетки»: (a, b)."""
+        if len(pts) >= 2:
+            fit = _linfit(pts)
+            if fit:
+                return fit
+        return 1.0 / pitch, -c0 / pitch   # резерв: позиционное приближение
+
+    fx = fit_axis(rulers_h, gx[0], pitch_x)
+    fy = fit_axis(rulers_v, gy[0], pitch_y)
+    if not rulers_h or not rulers_v:
+        report.append("! линейки не найдены — позиционное приближение")
+
+    # глифы из шапки листа (над верхней линейкой / левее левой) — не клетки схемы
+    top_bound = min((y for _, y in rulers_h), default=-1e9) - 0.5 * pitch_y
+    left_bound = min((x for _, x in rulers_v), default=-1e9) - 0.5 * pitch_x
+    glyphs = [g for g in glyphs if g[1] >= top_bound and g[0] >= left_bound]
+
     def to_col(x):
-        return round((x - gx[0]) / pitch_x)
+        return round(fx[0] * x + fx[1])
 
     def to_row(y):
-        return round((y - gy[0]) / pitch_y)
+        return round(fy[0] * y + fy[1])
 
     cells = {}
     quarters = []
@@ -195,9 +283,12 @@ def parse_chart_page(page, report):
             cell["color"] = rgb
             color_by_symbol[cell["symbol"]].append(rgb)
         else:
-            # заливка без символа-глифа: треугольник → ¾ креста, иначе игнор
+            # без глифа: чёрные треугольники — метки перекрытий листов, серые полосы —
+            # зона перекрытия соседнего листа: пропускаем; цветные треугольники — ¾
+            if max(rgb) < 0.15:
+                continue
             tri = [(it[1], it[2]) for it in dr["items"] if it[0] == "l"]
-            if len(dr["items"]) == 3 and len(tri) == 3:
+            if len(dr["items"]) == 3 and len(tri) == 3 and 0 <= col and 0 <= row:
                 vs = []
                 for a, b in tri:
                     for p in (a, b):
@@ -210,55 +301,19 @@ def parse_chart_page(page, report):
                     "pts": [[round((v[0] - cx) / pitch_x, 2), round((v[1] - cy) / pitch_y, 2)]
                             for v in vs],
                 })
-            else:
-                report.append(f"! заливка без символа при ({r.x0:.1f},{r.y0:.1f}) — пропущена")
 
-    # линейки: Arial ~6pt с номерами, кратными 10
-    rulers = []
-    d = page.get_text("dict")
-    for blk in d["blocks"]:
-        for ln in blk.get("lines", []):
-            for sp in ln["spans"]:
-                if "Arial" in sp["font"] and abs(sp["size"] - 6.0) < 0.5:
-                    t = sp["text"].strip()
-                    if re.fullmatch(r"\d+", t) and int(t) % 10 == 0:
-                        cx = (sp["bbox"][0] + sp["bbox"][2]) / 2
-                        cy = (sp["bbox"][1] + sp["bbox"][3]) / 2
-                        rulers.append({"t": t, "x": cx, "y": cy,
-                                       "horiz": cy < gy[0] or cy > gy[-1]})
-
-    def axis_offset(c0, pitch, rs, use_x):
-        """Сопоставить линейки (номера линий сетки) позиционным индексам клеток."""
-        offs = []
-        for r in rs:
-            v = r["x"] if use_x else r["y"]
-            if not (c0 - pitch <= v <= c0 + 100 * pitch):
-                continue
-            k = round((v - c0) / pitch)
-            offs.append(int(r["t"]) - k)
-        if not offs:
-            return None
-        most, _ = Counter(offs).most_common(1)[0]
-        return most
-
-    off_x = axis_offset(gx[0], pitch_x, [r for r in rulers if r["horiz"]], True)
-    off_y = axis_offset(gy[0], pitch_y, [r for r in rulers if not r["horiz"]], False)
-    if off_x is None or off_y is None:
-        report.append("! линейки не найдены — смещение листа неизвестно")
-        return None
-
-    # бэкстич: точки штрихов в координатах клеток (центр клетки = целое)
+    # бэкстич: точки штрихов в координатах клеток (границы клеток = полуклетки)
     backstitch = []
     for rgb, pts in strokes:
         seg = []
         for x, y in pts:
-            u = (x - gx[0]) / pitch_x + off_x
-            v = (y - gy[0]) / pitch_y + off_y
+            u = fx[0] * x + fx[1] - 0.5
+            v = fy[0] * y + fy[1] - 0.5
             seg.append((round(u * 4) / 4, round(v * 4) / 4))
         backstitch.append({"color": rgb, "points": seg})
 
     return {
-        "off_x": off_x, "off_y": off_y,
+        "off_x": 0, "off_y": 0,   # координаты уже глобальные (аффинно по линейкам)
         "ncols": len(gx), "nrows": len(gy),
         "cells": cells,
         "quarters": quarters,
@@ -280,27 +335,46 @@ def import_pdf(pdf_path, out_dir, name=None):
     doc = pymupdf.open(pdf_path)
     pages = list(doc)
 
+    # --- размер глифов-символов: самый массовый размер на «плотных» страницах ---
+    size_totals = Counter()
+    for page in pages:
+        for s, n in cs_sizes(page).items():
+            if n >= 200:
+                size_totals[s] += n
+    if not size_totals:
+        raise SystemExit("Не найдены страницы-листы схемы (нет глифов CrossStitch)")
+    chart_size = size_totals.most_common(1)[0][0]
+
     # --- классификация страниц ---
     legends, bs_legends, charts = [], [], []
     for idx, page in enumerate(pages):
-        n_chart = len(page_glyphs(page, 7.0))
-        n_legend = len(page_glyphs(page, 10.0))
-        if 20 <= n_legend <= 200:
-            legends.append(idx)
-        if n_legend < 10 and n_chart < 10 and page_colored_strokes(page):
-            bs_legends.append(idx)
-        if n_chart >= 500:
+        sizes = cs_sizes(page)
+        n_chart = sizes.get(chart_size, 0)
+        n_any = sum(sizes.values())
+        if n_chart >= 200:
             charts.append(idx)
-    if not charts:
-        raise SystemExit("Не найдены страницы-листы схемы (нет глифов CrossStitch)")
+        elif 8 <= n_any <= 400:
+            legends.append(idx)
+        elif n_any == 0 and len(page.get_drawings()) > 20 and page_colored_strokes(page):
+            bs_legends.append(idx)
     if not legends:
         raise SystemExit("Не найдена страница-легенда")
-    report.append(f"листы схемы: {[i + 1 for i in charts]}")
+    report.append(f"листы схемы: {[i + 1 for i in charts]} (шрифт {chart_size}pt)")
     report.append(f"страницы легенды: {[i + 1 for i in legends]}, бэкстич-легенда: {[i + 1 for i in bs_legends]}")
 
-    # --- размер из заголовка легенды ---
-    m = re.search(r"стежках:\s*(\d+)\s*[x×]\s*(\d+)", pages[legends[0]].get_text())
-    width, height = (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    # --- размер из заголовка легенды или обложки ---
+    width = height = None
+    size_patterns = [r"стежках:\s*(\d+)\s*[xх×]\s*(\d+)",
+                     r"[Рр]азмер:?\s*(\d+)\s*[xх×]\s*(\d+)\s*крест"]
+    for probe in [pages[i] for i in legends] + [pages[0]]:
+        text = probe.get_text()
+        for pat in size_patterns:
+            m = re.search(pat, text)
+            if m:
+                width, height = int(m.group(1)), int(m.group(2))
+                break
+        if width:
+            break
     report.append(f"размер схемы: {width} x {height}")
 
     # --- листы: среди найденных выбрать по 4 уникальных «Страница N» (приоритет — цветная версия с бэкстичем) ---
@@ -339,17 +413,15 @@ def import_pdf(pdf_path, out_dir, name=None):
     fills_by_symbol = defaultdict(list)
     parsed_pages = []
     for label, idx in picked:
-        data = parse_chart_page(pages[idx], report)
+        data = parse_chart_page(pages[idx], report, chart_size)
         if data is None:
             continue
         parsed_pages.append(data)
-        if label == 1:
-            data["off_x"], data["off_y"] = 0, 0   # «Страница 1» — левый верх схемы
         # выравнивание по содержимому: вокруг линеечной оценки ищем смещение
         # с минимумом конфликтов на перекрытии с уже собранной сеткой
         best_off, best_score = (data["off_x"], data["off_y"]), None
-        for ddx in range(-5, 6):
-            for ddy in range(-5, 6):
+        for ddx in range(-10, 11):
+            for ddy in range(-10, 11):
                 cx, cy = data["off_x"] + ddx, data["off_y"] + ddy
                 matched = conflicts = 0
                 for (col, row), cell in data["cells"].items():
@@ -403,21 +475,24 @@ def import_pdf(pdf_path, out_dir, name=None):
         })
         sym_to_id[sym] = palette[-1]["id"]
 
-    # --- сетка в pattern.json ---
-    maxc = max(c for c, _ in grid) if grid else 0
-    maxr = max(r for _, r in grid) if grid else 0
-    if width is None:
-        width, height = maxc + 1, maxr + 1
-    w, h = max(width, maxc + 1), max(height, maxr + 1)
+    # --- сетка в pattern.json: нормализуем отрицательные индексы, размер = факт ∪ легенда ---
+    if grid:
+        minc = min(c for c, _ in grid)
+        minr = min(r for _, r in grid)
+        maxc = max(c for c, _ in grid) - minc + 1
+        maxr = max(r for _, r in grid) - minr + 1
+        if minc or minr:
+            report.append(f"! сетка началась с ({minc},{minr}) — сдвигаю к нулю")
+            grid = {(c - minc, r - minr): cell for (c, r), cell in grid.items()}
+    else:
+        minc = minr = maxc = maxr = 0
+    w = max(width or 0, maxc)
+    h = max(height or 0, maxr)
+    if (width, height) and (w, h) != (width, height):
+        report.append(f"! фактический размер {w}x{h} отличается от заявленного {width}x{height}")
     g = [[-1] * w for _ in range(h)]
-    missing = 0
     for (c, r), cell in grid.items():
-        if 0 <= c < w and 0 <= r < h:
-            g[r][c] = sym_to_id[cell["symbol"]]
-        else:
-            missing += 1
-    if missing:
-        report.append(f"! {missing} клеток вне размера {w}x{h}")
+        g[r][c] = sym_to_id[cell["symbol"]]
 
     # --- бэкстич: цвет → dmc из легенды ---
     backstitches = []
@@ -444,7 +519,7 @@ def import_pdf(pdf_path, out_dir, name=None):
         "palette": palette,
         "grid": g,
         "quarters": [
-            {"x": q["x"], "y": q["y"],
+            {"x": q["x"] - minc, "y": q["y"] - minr,
              "color": next((p["dmc"] for p in palette
                             if p["rgb"] == _rgb_hex(q["rgb"])), _rgb_hex(q["rgb"])),
              "pts": q["pts"]}
